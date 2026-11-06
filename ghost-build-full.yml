@@ -1,0 +1,152 @@
+name: Build GhostGram IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Если сборка падает на версии Xcode, смени раннер (macos-15, macos-26 и т.д.)
+    runs-on: macos-latest
+    timeout-minutes: 300
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Select Xcode from versions.json
+        run: |
+          XCODE_VERSION=$(python3 -c 'import json;print(json.load(open("versions.json"))["xcode"])')
+          echo "Нужен Xcode $XCODE_VERSION"
+          ls /Applications | grep -i xcode || true
+          sudo xcode-select -s /Applications/Xcode_$XCODE_VERSION.app/Contents/Developer
+
+      - name: Create canonical source directory
+        run: |
+          sudo mkdir -p /Users/Shared
+          cp -R "$GITHUB_WORKSPACE" /Users/Shared/
+          mv "/Users/Shared/$(basename $GITHUB_WORKSPACE)" /Users/Shared/telegram-ios
+
+      - name: Apply ghost mode patch
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          cat > ghost-mode.patch <<'GHOST_PATCH_EOF'
+          diff --git a/submodules/TelegramCore/Sources/GhostMode.swift b/submodules/TelegramCore/Sources/GhostMode.swift
+          new file mode 100644
+          index 00000000..3f598cc8
+          --- /dev/null
+          +++ b/submodules/TelegramCore/Sources/GhostMode.swift
+          @@ -0,0 +1,24 @@
+          +import Foundation
+          +
+          +/// Режим призрака. Флаги хранятся в UserDefaults, по умолчанию всё включено.
+          +public enum GhostMode {
+          +    private static let defaults = UserDefaults.standard
+          +
+          +    private static func flag(_ key: String) -> Bool {
+          +        if defaults.object(forKey: key) == nil { return true }
+          +        return defaults.bool(forKey: key)
+          +    }
+          +
+          +    public static var hideRead: Bool {
+          +        get { return flag("ghost_hide_read") }
+          +        set { defaults.set(newValue, forKey: "ghost_hide_read") }
+          +    }
+          +    public static var hideTyping: Bool {
+          +        get { return flag("ghost_hide_typing") }
+          +        set { defaults.set(newValue, forKey: "ghost_hide_typing") }
+          +    }
+          +    public static var hideOnline: Bool {
+          +        get { return flag("ghost_hide_online") }
+          +        set { defaults.set(newValue, forKey: "ghost_hide_online") }
+          +    }
+          +}
+          diff --git a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+          index 7256668b..6078acc9 100644
+          --- a/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+          +++ b/submodules/TelegramCore/Sources/State/ManagedAccountPresence.swift
+          @@ -43,6 +43,9 @@ private final class AccountPresenceManagerImpl {
+               }
+               
+               private func updatePresence(_ isOnline: Bool) {
+          +        if GhostMode.hideOnline {
+          +            return
+          +        }
+                   let request: Signal<Api.Bool, MTRpcError>
+                   if isOnline {
+                       let timer = SignalKitTimer(timeout: 30.0, repeat: false, completion: { [weak self] in
+          diff --git a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+          index e8e08874..3702f31e 100644
+          --- a/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+          +++ b/submodules/TelegramCore/Sources/State/ManagedLocalInputActivities.swift
+          @@ -175,6 +175,9 @@ private func requestActivity(postbox: Postbox, network: Network, accountPeerId:
+                           }
+                       }
+                       
+          +            if GhostMode.hideTyping {
+          +                return .complete()
+          +            }
+                       if let inputPeer = apiInputPeer(peer) {
+                           var flags: Int32 = 0
+                           let topMessageId = threadId.flatMap { Int32(clamping: $0) }
+          diff --git a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+          index b2e65895..1db01fe6 100644
+          --- a/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+          +++ b/submodules/TelegramCore/Sources/State/SynchronizePeerReadState.swift
+          @@ -289,6 +289,8 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+                       case let .inputPeerChannel(inputPeerChannelData):
+                           let (channelId, accessHash) = (inputPeerChannelData.channelId, inputPeerChannelData.accessHash)
+                           switch readState {
+          +                case .idBased where GhostMode.hideRead:
+          +                    return .single(readState)
+                           case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+                               var pushSignal: Signal<Void, NoError> = network.request(Api.functions.channels.readHistory(channel: Api.InputChannel.inputChannel(.init(channelId: channelId, accessHash: accessHash)), maxId: maxIncomingReadId))
+                               |> `catch` { _ -> Signal<Api.Bool, NoError> in
+          @@ -319,6 +321,8 @@ private func pushPeerReadState(network: Network, postbox: Postbox, stateManager:
+                           }
+                       default:
+                           switch readState {
+          +                case .idBased where GhostMode.hideRead:
+          +                    return .single(readState)
+                           case let .idBased(maxIncomingReadId, _, _, _, markedUnread):
+                               var pushSignal: Signal<Void, NoError> = network.request(Api.functions.messages.readHistory(peer: inputPeer, maxId: maxIncomingReadId))
+                               |> map(Optional.init)
+          GHOST_PATCH_EOF
+          git apply --verbose ghost-mode.patch
+
+      - name: Write config with your api_id / api_hash
+        working-directory: /Users/Shared/telegram-ios
+        env:
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          p = "build-system/appstore-configuration.json"
+          c = json.load(open(p))
+          c["api_id"] = os.environ["API_ID"]
+          c["api_hash"] = os.environ["API_HASH"]
+          json.dump(c, open("build-system/ghost-configuration.json", "w"), indent=2)
+          PY
+
+      - name: Build unsigned IPA
+        working-directory: /Users/Shared/telegram-ios
+        run: |
+          set -x
+          BUILD_NUMBER="$(( $(git rev-list --count HEAD) + $(cat build_number_offset) ))"
+          python3 build-system/Make/ImportCertificates.py --path build-system/fake-codesigning/certs
+          python3 -u build-system/Make/Make.py \
+            --bazelUserRoot=/private/var/tmp/_bazel_containerhost \
+            build \
+            --configurationPath=build-system/ghost-configuration.json \
+            --codesigningInformationPath=build-system/fake-codesigning \
+            --configuration=release_arm64 \
+            --buildNumber="$BUILD_NUMBER"
+          mkdir -p build/artifacts
+          cp bazel-out/applebin_ios-ios_arm*-opt-ST-*/bin/Telegram/Telegram.ipa build/artifacts/GhostGram.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GhostGram-ipa
+          path: /Users/Shared/telegram-ios/build/artifacts/GhostGram.ipa
